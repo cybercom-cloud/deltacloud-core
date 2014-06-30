@@ -16,6 +16,10 @@
 
 require 'openstack'
 require 'tempfile'
+require 'base64'
+require 'json'
+
+require_relative '../../models/instance_metadata.rb'
 
 module Deltacloud
   module Drivers
@@ -204,6 +208,9 @@ module Deltacloud
           if opts[:user_data] && opts[:user_data].length > 0
             params[:user_data]=opts[:user_data]
           end
+          if opts[:metadata] && opts[:metadata].length > 0
+            params[:metadata] = meta_json_parse(opts[:metadata])
+          end
           safely do
             server = os.create_server(params)
             result = convert_from_server(server, os.connection.authuser, get_attachments(server.id, os))
@@ -247,7 +254,7 @@ module Deltacloud
             server.stop
           end
         end
-        
+
         def start_instance(credentials, instance_id)
           os = new_client(credentials)
           safely do
@@ -492,7 +499,81 @@ module Deltacloud
           end
         end
 
+        def update_instance_metadata(credentials, opts={})
+          os = new_client(credentials)
+          server = os.get_server(opts[:id])
+          if server
+            if opts[:metadata] && opts[:metadata].length > 0
+              update_instance_metadata_full(server, opts[:metadata])
+            end
+            if opts[:key]
+              update_instance_metadata_key(server, opts[:key], opts[:value])
+            end
+          end
+          get_instance_metadata_os(os, opts)
+        end
+
+        def delete_instance_metadata(credentials, opts={})
+          os = new_client(credentials)
+          server = os.get_server(opts[:id])
+          if server
+            if opts[:key]
+              delete_instance_metadata_key(server, opts[:key])
+            else
+              delete_instance_metadata_full(server)
+            end
+          end
+          get_instance_metadata_os(os, opts)
+        end
+
+        def get_instance_metadata(credentials, opts={})
+          os = new_client(credentials)
+          get_instance_metadata_os(os, opts)
+        end
+
 private
+
+        def get_instance_metadata_os(os, opts={})
+          server = os.get_server(opts[:id])
+          op = (server.class == Hash)? :fetch : :send
+          convert_instance_metadata(server.send(op, :metadata))
+        end
+
+        def delete_instance_metadata_key(server, metakey)
+          server.metadata.delete([metakey])
+          server.metadata.save
+        end
+
+        def delete_instance_metadata_full(server)
+          server.metadata.clear
+          server.metadata.save
+        end
+
+        def update_instance_metadata_key(server, metakey, metavalue)
+          if not metavalue
+            metavalue = ''
+          end
+          metavalue = Base64.decode64(metavalue)
+          server.metadata.store(metakey, metavalue)
+          server.metadata.save
+        end
+
+        def update_instance_metadata_full(server, meta)
+          meta = meta_json_parse(meta)
+          meta.each_pair { |k, v|
+           server.metadata.store(k, v)
+          }
+          server.metadata.save
+        end
+
+        def meta_json_parse(data)
+          begin
+            JSON.parse(Base64.decode64(data), :max_nesting =>1)
+          rescue Exception => e
+            raise ValidationFailure.new(Exception.new("Metadata parse error"))
+          end
+        end
+
         #for v2 authentication credentials.name == "username+tenant_name"
         def new_client(credentials, type="compute", ignore_provider=false)
           tokens = credentials.user.split("+")
@@ -573,11 +654,28 @@ private
             :password => password,
             :keyname => server.send(op, :key_name),
             :launch_time => server.send(op, :created),
+            :metadata => convert_instance_metadata(server.send(op, :metadata)),
             :storage_volumes => attachments.inject([]){|res, cur| res << {cur[:volumeId] => cur[:device]} ;res}
           )
           inst.actions = instance_actions_for(inst.state)
           inst.create_image = 'RUNNING'.eql?(inst.state)
           inst
+        end
+
+        def convert_instance_metadata(metadata)
+          imd = {}
+          if metadata
+            if metadata.class == Hash
+              metadata.keys.each do |k|
+               imd[k] = metadata[k]
+              end
+            else
+              metadata.each_pair { |k, v|
+                imd[k] = v
+              }
+            end
+          end
+          Deltacloud::InstanceMetadata.new(imd)
         end
 
         def convert_instance_state(openstack_state)
@@ -629,6 +727,7 @@ private
         def convert_key(key)
           Key.new(
             :id => key[:name],
+            :name => key[:name],
             :fingerprint => key[:fingerprint],
             :credential_type => :key,
             :pem_rsa_key => key[:private_key], # only available once, on create_key
@@ -646,10 +745,14 @@ private
         end
 
         def convert_volume(vol)
+          state = (vol.attachments.inject([]){|res, cur| res << cur if cur.size > 0 ; res}.empty?) ? "AVAILABLE" : "IN-USE"
+          if vol.status
+            state = vol.status.upcase
+          end
           StorageVolume.new({ :id => vol.id,
                               :name => vol.display_name,
                               :created => vol.created_at,
-                              :state => (vol.attachments.inject([]){|res, cur| res << cur if cur.size > 0 ; res}.empty?) ? "AVAILABLE" : "IN-USE",
+                              :state => state,
                               :capacity => vol.size,
                               :instance_id => (vol.attachments.first["server_id"] unless vol.attachments.empty?),
                               :device => (vol.attachments.first["device"] unless vol.attachments.empty?),
@@ -736,8 +839,6 @@ private
           end
 
         end
-
-
       end
     end
   end
